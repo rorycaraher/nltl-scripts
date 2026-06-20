@@ -62,9 +62,11 @@ process_zip() {
     local is_bandcamp=false
     if echo "$source_url" | grep -qi "bandcamp\.com"; then
         is_bandcamp=true
-    elif echo "$filename" | grep -qiE "^[a-z0-9_-]+-[a-z0-9_-]+\.(zip)$"; then
-        # Bandcamp zips follow the pattern artist-album.zip; treat as likely match
-        # when no URL metadata is available (e.g. downloaded via a download manager)
+    elif [[ -z "$source_url" ]] && echo "$filename" | grep -qiE "^[a-z0-9_-]+-[a-z0-9_-]+\.(zip)$"; then
+        # No URL metadata at all — fall back to filename heuristic.
+        # Bandcamp zips follow the pattern artist-album.zip (e.g. downloaded via
+        # a download manager that doesn't write extended attributes).
+        # If a URL was found but wasn't bandcamp.com, skip the file.
         is_bandcamp=true
     fi
 

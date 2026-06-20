@@ -60,7 +60,7 @@ process_zip() {
     fi
 
     local is_bandcamp=false
-    if echo "$source_url" | grep -qi "bandcamp\.com"; then
+    if echo "$source_url" | grep -qiE "bandcamp\.com|bcbits\.com"; then
         is_bandcamp=true
     elif [[ -z "$source_url" ]] && echo "$filename" | grep -qiE "^[a-z0-9_-]+-[a-z0-9_-]+\.(zip)$"; then
         # No URL metadata at all — fall back to filename heuristic.

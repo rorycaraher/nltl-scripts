@@ -91,14 +91,17 @@ process_zip() {
 
     mkdir -p "$target"
 
-    if unzip -q "$zip" -d "$target"; then
+    # ditto -xk is macOS's native zip extractor and handles special characters
+    # in filenames (backticks, apostrophes, etc.) that trip up unzip.
+    if ditto -xk "$zip" "$target"; then
         log "Extracted → $target"
         # Mark as processed before deleting (so a crash mid-delete doesn't re-process)
         echo "$zip" >> "$PROCESSED_LOG"
         rm -f "$zip"
         log "Deleted $filename"
     else
-        log "ERROR: Failed to extract $filename — leaving zip in place."
+        log "ERROR: Failed to extract $filename — removing partial files, leaving zip in place."
+        rm -rf "$target"
     fi
 }
 

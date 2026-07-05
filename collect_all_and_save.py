@@ -7,18 +7,20 @@ documentation, which was found to be inaccurate on destination-folder naming
 and Max for Live collection scope:
 
 - Only touches <FileRef> nodes that are the direct child of a <SampleRef>
-  (i.e. actual audio-clip content). Devices, racks, presets, M4L patches,
-  VST state, and Pack content are never modified, matching observed Ableton
-  behavior for those cases.
+  (audio-clip content) or <MxPatchRef> (Max for Live device content) --
+  the two have an identical FileRef shape. Racks, presets, VST state, and
+  Pack content are never modified, matching observed Ableton behavior for
+  those cases.
 - Pack content (LivePackId non-empty) is always left alone.
 - Ableton "Builtin" content bundled inside the app itself (path contains
   ".app/Contents/", e.g. Hybrid Reverb's factory impulse responses) is
   always left alone, for the same reason as Packs: guaranteed present
   alongside any matching Ableton install.
-- Any SampleRef whose absolute Path already lives inside the project folder
-  is left alone.
-- Every other SampleRef is treated as external and collected into
-  <project>/Samples/Imported/<basename> -- deliberately flattened, not
+- Any reference whose absolute Path already lives inside the project
+  folder is left alone.
+- Everything else external is collected flattened into
+  <project>/Samples/Imported/<basename> (audio) or
+  <project>/Presets/Imported/<basename> (M4L devices) -- deliberately not
   mirroring Ableton's own (partially unverified) subfolder-preservation
   heuristic.
 - On a destination collision (two different external files -> same
@@ -59,13 +61,20 @@ class CollectError(Exception):
     pass
 
 
-class SampleRefHandler(xml.sax.ContentHandler):
+CONTAINER_DEST_ROOTS = {
+    "SampleRef": "Samples",
+    "MxPatchRef": "Presets",
+}
+
+
+class FileRefHandler(xml.sax.ContentHandler):
     """Walks the document tracking line numbers, recording -- for each
-    <SampleRef> -- the direct-child <FileRef>'s RelativePathType/
-    RelativePath/Path/LivePackId, plus the sibling LastModDate. Nested
-    FileRefs (e.g. under SourceContext/OriginalFileRef) are ignored because
-    they never sit at the tracked FileRef's exact depth with parent
-    'FileRef'.
+    <SampleRef> or <MxPatchRef> (identical FileRef shape, one for audio-clip
+    content, one for Max for Live devices) -- the direct-child <FileRef>'s
+    RelativePathType/RelativePath/Path/LivePackId, plus the sibling
+    LastModDate. Nested FileRefs (e.g. under SourceContext/OriginalFileRef)
+    are ignored because they never sit at the tracked FileRef's exact depth
+    with parent 'FileRef'.
     """
 
     TRACKED_FILEREF_FIELDS = {"RelativePathType", "RelativePath", "Path", "LivePackId"}
@@ -85,13 +94,14 @@ class SampleRefHandler(xml.sax.ContentHandler):
         parent_depth = len(self.stack)
         parent_name = self.stack[-1] if self.stack else None
 
-        if name == "SampleRef":
-            self.context_stack.append({"fields": {}, "file_ref_depth": None})
+        if name in CONTAINER_DEST_ROOTS:
+            self.context_stack.append({"container": name, "fields": {}, "file_ref_depth": None})
         elif self.context_stack:
             current = self.context_stack[-1]
-            if name == "FileRef" and parent_name == "SampleRef" and current["file_ref_depth"] is None:
+            container = current["container"]
+            if name == "FileRef" and parent_name == container and current["file_ref_depth"] is None:
                 current["file_ref_depth"] = parent_depth + 1
-            elif name == "LastModDate" and parent_name == "SampleRef":
+            elif name == "LastModDate" and parent_name == container:
                 current["fields"]["LastModDate"] = {"line": line, "value": attrs.get("Value")}
             elif (
                 current["file_ref_depth"] is not None
@@ -105,7 +115,7 @@ class SampleRefHandler(xml.sax.ContentHandler):
 
     def endElement(self, name):
         self.stack.pop()
-        if name == "SampleRef" and self.context_stack:
+        if name in CONTAINER_DEST_ROOTS and self.context_stack:
             self.results.append(self.context_stack.pop())
 
 
@@ -179,8 +189,9 @@ def analyze(sample_refs, project_root: Path, lines: list):
 
     for ctx in sample_refs:
         fields = ctx["fields"]
+        container = ctx["container"]
         if ctx["file_ref_depth"] is None:
-            continue  # no FileRef under this SampleRef at all
+            continue  # no FileRef under this container at all
 
         live_pack_id = fields.get("LivePackId", {}).get("value")
         if live_pack_id:
@@ -204,7 +215,7 @@ def analyze(sample_refs, project_root: Path, lines: list):
         missing = [f for f in required if f not in fields]
         if missing:
             problems.append(
-                f"unrecognized SampleRef structure for {source_path} "
+                f"unrecognized {container} structure for {source_path} "
                 f"(missing field(s): {', '.join(missing)}) -- refusing to guess"
             )
             continue
@@ -225,7 +236,8 @@ def analyze(sample_refs, project_root: Path, lines: list):
             )
             continue
 
-        dest_path = project_root / "Samples" / "Imported" / source_path.name
+        dest_root = CONTAINER_DEST_ROOTS[container]
+        dest_path = project_root / dest_root / "Imported" / source_path.name
 
         to_collect.append(
             {
@@ -260,13 +272,13 @@ def collect_one(input_path: Path) -> dict:
     decide how to report and whether to continue. Possible "status" values:
     "failed" (nothing copied or written, see "problems"), "nothing" (no
     external audio found, nothing to do), "collected" (see "report",
-    "count", "unique", "dest_dir", "output").
+    "count", "unique", "dest_dirs", "output").
     """
     project_root = input_path.parent
     raw = gzip.decompress(input_path.read_bytes()).decode("utf-8")
     lines = raw.splitlines(keepends=True)
 
-    handler = SampleRefHandler()
+    handler = FileRefHandler()
     xml.sax.parseString(raw.encode("utf-8"), handler)
 
     to_collect, problems = analyze(handler.results, project_root, lines)
@@ -278,8 +290,8 @@ def collect_one(input_path: Path) -> dict:
         return {"status": "nothing"}
 
     run_timestamp = str(int(time.time()))
-    dest_dir = project_root / "Samples" / "Imported"
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    for dest_root in CONTAINER_DEST_ROOTS.values():
+        (project_root / dest_root / "Imported").mkdir(parents=True, exist_ok=True)
 
     # All line edits are computed (and, per the analyze() pre-check, guaranteed
     # patchable) before any file is copied, and any copy this run performs is
@@ -302,7 +314,7 @@ def collect_one(input_path: Path) -> dict:
                     report.append(f"reused  {dest} (already present, identical content)")
                 copied.add(dest)
 
-            rel_path_value = f"Samples/Imported/{dest.name}"
+            rel_path_value = dest.relative_to(project_root).as_posix()
             edits[entry["relpathtype_line"]] = replace_attr_value(lines[entry["relpathtype_line"] - 1], "3")
             edits[entry["relpath_line"]] = replace_attr_value(lines[entry["relpath_line"] - 1], rel_path_value)
             edits[entry["path_line"]] = replace_attr_value(lines[entry["path_line"] - 1], str(dest))
@@ -321,12 +333,13 @@ def collect_one(input_path: Path) -> dict:
             "problems": [f"unexpected error, rolled back {len(newly_created)} copied file(s): {exc}"],
         }
 
+    dest_dirs = sorted({p.parent for p in copied})
     return {
         "status": "collected",
         "report": report,
         "count": len(to_collect),
         "unique": len(copied),
-        "dest_dir": dest_dir,
+        "dest_dirs": dest_dirs,
         "output": output_path,
     }
 
@@ -350,7 +363,8 @@ def run_single(input_path: Path):
 
     for line in result["report"]:
         print(line)
-    print(f"Collected {result['count']} reference(s), {result['unique']} unique file(s), into {result['dest_dir']}")
+    dest_dirs = ", ".join(str(d) for d in result["dest_dirs"])
+    print(f"Collected {result['count']} reference(s), {result['unique']} unique file(s), into {dest_dirs}")
     print(f"Wrote {result['output']}")
 
 

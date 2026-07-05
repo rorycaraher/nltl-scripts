@@ -26,14 +26,23 @@ and Max for Live collection scope:
   different content aborts the whole run.
 - A missing source file aborts the whole run.
 - The input .als is never modified; output is always written to a new,
-  numbered file.
+  numbered file. If that number is already taken by another file sitting
+  in the directory, the next free number is used instead -- the input is
+  still never touched, and nothing already there is ever overwritten.
 
 Everything is analyzed before anything is written: if any problem is found
 (missing file, real collision, unrecognized structure), nothing is copied
 and nothing is written -- every problem found is reported together.
 
+With --all, every top-level .als file in the current directory (a fixed
+snapshot taken at launch -- files created during the run are never picked
+up) is processed independently: one file failing doesn't stop the others,
+and a summary is printed at the end. Subfolders (e.g. Ableton's own
+Backup/) are never scanned.
+
 Usage:
     collect_all_and_save.py <path-to-.als>
+    collect_all_and_save.py --all
 """
 
 import hashlib
@@ -101,12 +110,27 @@ class SampleRefHandler(xml.sax.ContentHandler):
 
 
 def next_output_path(input_path: Path) -> Path:
-    m = re.match(r"^(.*-)(\d{2})(\.als)$", input_path.name)
+    """The next numbered filename, skipping past any that already exist --
+    e.g. if a directory already has -01 through -03, a -01 input's output
+    lands at -04, not -02. Never returns a path that already exists.
+    """
+    m = re.match(r"^(.*-)(\d{2,})(\.als)$", input_path.name)
     if m:
         prefix, num, suffix = m.groups()
-        new_num = str(int(num) + 1).zfill(len(num))
-        return input_path.with_name(f"{prefix}{new_num}{suffix}")
-    return input_path.with_name(f"{input_path.stem}-01{input_path.suffix}")
+        width = len(num)
+        n = int(num)
+        while True:
+            n += 1
+            candidate = input_path.with_name(f"{prefix}{str(n).zfill(width)}{suffix}")
+            if not candidate.exists():
+                return candidate
+
+    n = 1
+    while True:
+        candidate = input_path.with_name(f"{input_path.stem}-{str(n).zfill(2)}{input_path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
 
 
 def sha256_of(path: Path, cache: dict) -> str:
@@ -230,7 +254,14 @@ def analyze(sample_refs, project_root: Path, lines: list):
     return to_collect, problems
 
 
-def collect(input_path: Path):
+def collect_one(input_path: Path) -> dict:
+    """Runs Collect All and Save for one file. Never exits the process --
+    always returns a result dict so both single-file and --all callers can
+    decide how to report and whether to continue. Possible "status" values:
+    "failed" (nothing copied or written, see "problems"), "nothing" (no
+    external audio found, nothing to do), "collected" (see "report",
+    "count", "unique", "dest_dir", "output").
+    """
     project_root = input_path.parent
     raw = gzip.decompress(input_path.read_bytes()).decode("utf-8")
     lines = raw.splitlines(keepends=True)
@@ -241,14 +272,10 @@ def collect(input_path: Path):
     to_collect, problems = analyze(handler.results, project_root, lines)
 
     if problems:
-        print("Aborted -- nothing was copied or written. Problems found:", file=sys.stderr)
-        for p in problems:
-            print(f"  - {p}", file=sys.stderr)
-        sys.exit(1)
+        return {"status": "failed", "problems": problems}
 
     if not to_collect:
-        print("Nothing to collect -- no external SampleRef audio found.")
-        return
+        return {"status": "nothing"}
 
     run_timestamp = str(int(time.time()))
     dest_dir = project_root / "Samples" / "Imported"
@@ -289,27 +316,101 @@ def collect(input_path: Path):
     except Exception as exc:
         for path in newly_created:
             path.unlink(missing_ok=True)
-        print(f"Aborted after an unexpected error -- rolled back {len(newly_created)} copied file(s).", file=sys.stderr)
-        print(f"  {exc}", file=sys.stderr)
-        sys.exit(1)
+        return {
+            "status": "failed",
+            "problems": [f"unexpected error, rolled back {len(newly_created)} copied file(s): {exc}"],
+        }
 
-    for line in report:
-        print(line)
-    print(f"Collected {len(to_collect)} reference(s), {len(copied)} unique file(s), into {dest_dir}")
-    print(f"Wrote {output_path}")
+    return {
+        "status": "collected",
+        "report": report,
+        "count": len(to_collect),
+        "unique": len(copied),
+        "dest_dir": dest_dir,
+        "output": output_path,
+    }
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("usage: collect_all_and_save.py <path-to-.als>", file=sys.stderr)
-        sys.exit(2)
-
-    input_path = Path(sys.argv[1]).resolve()
+def run_single(input_path: Path):
     if not input_path.is_file():
         print(f"error: {input_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    collect(input_path)
+    result = collect_one(input_path)
+
+    if result["status"] == "failed":
+        print("Aborted -- nothing was copied or written. Problems found:", file=sys.stderr)
+        for p in result["problems"]:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(1)
+
+    if result["status"] == "nothing":
+        print("Nothing to collect -- no external SampleRef audio found.")
+        return
+
+    for line in result["report"]:
+        print(line)
+    print(f"Collected {result['count']} reference(s), {result['unique']} unique file(s), into {result['dest_dir']}")
+    print(f"Wrote {result['output']}")
+
+
+def run_batch():
+    """Processes every top-level .als in the current directory, one file's
+    failure never stopping the others. The file list is a fixed snapshot
+    taken before any processing starts.
+    """
+    als_files = sorted(p for p in Path.cwd().glob("*.als") if p.is_file())
+
+    if not als_files:
+        print(f"No .als files found in {Path.cwd()}")
+        return
+
+    results = []
+    for input_path in als_files:
+        print(f"== {input_path.name} ==")
+        result = collect_one(input_path)
+        results.append((input_path, result))
+
+        if result["status"] == "failed":
+            for p in result["problems"]:
+                print(f"  - {p}", file=sys.stderr)
+        elif result["status"] == "nothing":
+            print("  nothing to collect")
+        else:
+            for line in result["report"]:
+                print(f"  {line}")
+            print(f"  collected {result['count']} reference(s), {result['unique']} unique file(s)")
+            print(f"  wrote {result['output'].name}")
+        print()
+
+    print("Summary:")
+    failed = 0
+    for input_path, result in results:
+        if result["status"] == "failed":
+            failed += 1
+            print(f"  FAILED     {input_path.name} -- {len(result['problems'])} problem(s), see above")
+        elif result["status"] == "nothing":
+            print(f"  unchanged  {input_path.name} -- nothing to collect")
+        else:
+            print(f"  collected  {input_path.name} -> {result['output'].name}")
+
+    if failed:
+        sys.exit(1)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if args == ["--all"]:
+        run_batch()
+        return
+
+    if len(args) != 1 or args[0].startswith("-"):
+        print("usage: collect_all_and_save.py <path-to-.als>", file=sys.stderr)
+        print("       collect_all_and_save.py --all", file=sys.stderr)
+        sys.exit(2)
+
+    run_single(Path(args[0]).resolve())
 
 
 if __name__ == "__main__":

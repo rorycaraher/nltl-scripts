@@ -1,46 +1,29 @@
 #!/usr/bin/env python3
-"""Automate Ableton Live's "Collect All and Save" for a .als file.
+"""Scriptable version of Ableton's "Collect All and Save" for a .als file.
 
-Scope, deliberately narrower than Ableton's own feature, based on empirical
-diffing of real before/after .als files (Live 12.4.2) rather than Ableton's
-documentation, which was found to be inaccurate on destination-folder naming
-and Max for Live collection scope:
+Reverse-engineered from real before/after .als diffs (Live 12.4.2), not
+Ableton's docs -- deliberately narrower than the real feature:
 
-- Only touches <FileRef> nodes that are the direct child of a <SampleRef>
-  (audio-clip content) or <MxPatchRef> (Max for Live device content) --
-  the two have an identical FileRef shape. Racks, presets, VST state, and
-  Pack content are never modified, matching observed Ableton behavior for
-  those cases.
-- Pack content (LivePackId non-empty) is always left alone.
-- Ableton "Builtin" content bundled inside the app itself (path contains
-  ".app/Contents/", e.g. Hybrid Reverb's factory impulse responses) is
-  always left alone, for the same reason as Packs: guaranteed present
-  alongside any matching Ableton install.
-- Any reference whose absolute Path already lives inside the project
-  folder is left alone.
-- Everything else external is collected flattened into
-  <project>/Samples/Imported/<basename> (audio) or
-  <project>/Presets/Imported/<basename> (M4L devices) -- deliberately not
-  mirroring Ableton's own (partially unverified) subfolder-preservation
-  heuristic.
-- On a destination collision (two different external files -> same
-  basename), content is compared by hash: identical content is deduped,
-  different content aborts the whole run.
-- A missing source file aborts the whole run.
-- The input .als is never modified; output is always written to a new,
-  numbered file. If that number is already taken by another file sitting
-  in the directory, the next free number is used instead -- the input is
-  still never touched, and nothing already there is ever overwritten.
+Collects (flattened, not mirroring Ableton's own subfolder-preservation
+heuristic):
+  - audio          <SampleRef>/<FileRef>  -> Samples/Imported/<basename>
+  - M4L devices    <MxPatchRef>/<FileRef> -> Presets/Imported/<basename>
+(identical FileRef shape, same rules for both)
 
-Everything is analyzed before anything is written: if any problem is found
-(missing file, real collision, unrecognized structure), nothing is copied
-and nothing is written -- every problem found is reported together.
+Leaves alone: Pack content (LivePackId set), Ableton's own bundled
+"Builtin" content (path contains ".app/Contents/"), anything already
+inside the project, and everything else -- racks, presets, VST state.
 
-With --all, every top-level .als file in the current directory (a fixed
-snapshot taken at launch -- files created during the run are never picked
-up) is processed independently: one file failing doesn't stop the others,
-and a summary is printed at the end. Subfolders (e.g. Ableton's own
-Backup/) are never scanned.
+Safety:
+  - Never modifies the input; always writes a new numbered file, skipping
+    any number already taken rather than overwriting it.
+  - Fully analyzed before anything is written: a destination collision
+    between different content, a missing source file, or anything
+    unrecognized aborts that file -- nothing copied, nothing written.
+  - --all processes every top-level .als in the current directory (a fixed
+    snapshot at launch; Backup/ and other subfolders are never scanned).
+    Each file is independent -- one failing doesn't stop the rest -- and a
+    summary prints at the end.
 
 Usage:
     collect_all_and_save.py <path-to-.als>
